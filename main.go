@@ -5,58 +5,93 @@ import (
 	"Bank_system_management/models"
 	"log"
 	"net/http"
-
+	"strconv"
+	"time"
+	"github.com/dgrijalva/jwt-go"
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 	"golang.org/x/crypto/bcrypt"
 )
 
-// main - точка входа в приложение
+func GenerateToken(userID uint) (string, error) {
+	expirationTime := time.Now().Add(15 * time.Minute)
+	claims := &jwt.StandardClaims{
+		ExpiresAt: expirationTime.Unix(),
+		Issuer:    "bank-system-management",
+		Subject:   strconv.Itoa(int(userID)), // сохранение только числового идентификатора
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenString, err := token.SignedString([]byte("secret"))
+	return tokenString, err
+}
+
+func JWTMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		tokenString := c.GetHeader("Authorization")
+		if tokenString == "" {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+			c.Abort()
+			return
+		}
+
+		// Удаление префикса "Bearer "
+		tokenString = tokenString[len("Bearer "):]
+
+		token, err := jwt.ParseWithClaims(tokenString, &jwt.StandardClaims{}, func(token *jwt.Token) (interface{}, error) {
+			return []byte("secret"), nil
+		})
+		if err != nil || !token.Valid {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+			c.Abort()
+			return
+		}
+
+		claims := token.Claims.(*jwt.StandardClaims)
+		userID, err := strconv.Atoi(claims.Subject) // преобразование Subject обратно в число
+		if err != nil {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
+			c.Abort()
+			return
+		}
+
+		var user models.User
+		if err := config.DB.First(&user, userID).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "User not found"})
+			c.Abort()
+			return
+		}
+
+		c.Set("user", user)
+		c.Next()
+	}
+}
+
 func main() {
-	// Загрузка переменных окружения из .env файла
 	err := godotenv.Load()
 	if err != nil {
-		log.Fatal("Error loading .env file:", err)
+		log.Fatal("Error loading.env file:", err)
 	}
 
-	// Инициализация базы данных
 	config.InitDB()
-
-	// Автоматическая миграция моделей
 	config.AutoMigrate(&models.User{}, &models.Transaction{})
 
-	// Инициализация маршрутизатора Gin
 	router := gin.Default()
+	router.POST("/auth/login", LoginUser)
+	router.POST("/auth/register", RegisterUser)
 
-	// Определение маршрутов и обработчиков
-	router.POST("/register", RegisterUser)
-	router.POST("/login", LoginUser)
-	router.POST("/transaction", CreateTransaction)
-	router.POST("/withdraw", Withdraw)
-	router.POST("/deposit", Deposit)
-	router.GET("/transaction/history", TransactionHistory)
-	router.GET("/user/access/:id", UserAccess)
-	router.GET("/user/details/:id", UserDetails)
-	router.PUT("/user/update/:id", UpdateUserInfo)
-	router.DELETE("/user/:id", DeleteUser)
+	authRouter := router.Group("/").Use(JWTMiddleware())
+	authRouter.POST("/transaction", CreateTransaction)
+	authRouter.POST("/withdraw", Withdraw)
+	authRouter.POST("/deposit", Deposit)
+	authRouter.GET("/transaction/history", TransactionHistory)
+	authRouter.GET("/user/access/:id", UserAccess)
+	authRouter.GET("/user/details/:id", UserDetails)
+	authRouter.PUT("/user/update/:id", UpdateUserInfo)
+	authRouter.DELETE("/user/:id", DeleteUser)
 
-	// Запуск сервера
 	router.Run(":8080")
 }
 
-// HashPassword hashes the given password using bcrypt.
-func HashPassword(password string) (string, error) {
-	bytes, err := bcrypt.GenerateFromPassword([]byte(password), 14)
-	return string(bytes), err
-}
-
-// CheckPasswordHash compares a plain password with a hashed password.
-func CheckPasswordHash(password, hash string) bool {
-	err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
-	return err == nil
-}
-
-// RegisterUser - обработчик для регистрации нового пользователя
 func RegisterUser(c *gin.Context) {
 	var user models.User
 	if err := c.ShouldBindJSON(&user); err != nil {
@@ -64,39 +99,52 @@ func RegisterUser(c *gin.Context) {
 		return
 	}
 
-	// Hash the password before saving
-	hashedPassword, err := HashPassword(user.Password)
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(user.Password), 14)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
 		return
 	}
-	user.Password = hashedPassword
+	user.Password = string(hashedPassword)
 
 	if err := config.DB.Create(&user).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"message": "User registered successfully"})
+
+	token, err := GenerateToken(user.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
+		return
+	}
+	c.Header("Authorization", "Bearer "+token)
+	c.JSON(http.StatusOK, gin.H{"token": token})
 }
 
-// LoginUser - обработчик для входа пользователя
 func LoginUser(c *gin.Context) {
 	var user models.User
 	if err := c.ShouldBindJSON(&user); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+
 	var dbUser models.User
 	if err := config.DB.Where("email = ?", user.Email).First(&dbUser).Error; err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid email or password"})
 		return
 	}
-	// Compare the hashed password with the plain password
-	if !CheckPasswordHash(user.Password, dbUser.Password) {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
+
+	if err := bcrypt.CompareHashAndPassword([]byte(dbUser.Password), []byte(user.Password)); err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid email or password"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"message": "User logged in successfully"})
+
+	token, err := GenerateToken(dbUser.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
+		return
+	}
+	c.Header("Authorization", "Bearer "+token)
+	c.JSON(http.StatusOK, gin.H{"token": token})
 }
 
 // CreateTransaction - обработчик для создания новой транзакции
